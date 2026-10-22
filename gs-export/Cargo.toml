@@ -1,0 +1,10 @@
+[package]
+name = "gs-export"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Photos -> COLMAP-format sparse/0 dataset folder for Gaussian Splatting trainers, 100% Rust"
+
+[dependencies]
+colmap-io = { path = "../colmap-io" }
+sfm-lite = { path = "../sfm-lite" }

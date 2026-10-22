@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["colmap-io", "sfm-lite", "gs-export"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,8 @@
+[package]
+name = "colmap-io"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native Rust, std-only reader/writer for COLMAP sparse reconstruction files (cameras/images/points3D, .bin and .txt)"
+
+[dependencies]
