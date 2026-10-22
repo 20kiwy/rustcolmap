@@ -49,6 +49,8 @@ pub struct Options {
     pub sequential: bool,
     /// Focal heuristic: focal = focal_mult * max(w, h) when EXIF is absent.
     pub focal_mult: f64,
+    /// Read EXIF 35mm-equivalent focal priors (JPEG sources).
+    pub use_exif: bool,
 }
 
 impl Default for Options {
@@ -64,6 +66,7 @@ impl Default for Options {
             ba_every: 4,
             sequential: false,
             focal_mult: 1.2,
+            use_exif: true,
         }
     }
 }
@@ -85,6 +88,31 @@ fn is_image(p: &Path) -> bool {
             .as_deref(),
         Some("jpg" | "jpeg" | "png" | "bmp" | "tif" | "tiff" | "webp")
     )
+}
+
+/// EXIF focal prior at the file's own resolution, in pixels.
+/// Uses the 35mm-equivalent focal when present (f_px = f35 * max_side / 36),
+/// which is sensor-independent. Returns None when absent/unreadable.
+fn exif_focal_px(path: &Path, w: u32, h: u32) -> Option<f64> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = std::io::BufReader::new(file);
+    let ex = exif::Reader::new().read_from_container(&mut buf).ok()?;
+    let field = ex.get_field(exif::Tag::FocalLengthIn35mmFilm, exif::In::PRIMARY)?;
+    let f35 = match &field.value {
+        exif::Value::Short(v) => v.first().map(|&x| x as f64),
+        exif::Value::Rational(v) => v.first().map(|r| {
+            if r.denom > 0 {
+                r.num as f64 / r.denom as f64
+            } else {
+                0.0
+            }
+        }),
+        _ => None,
+    }?;
+    if f35 <= 0.0 || w == 0 || h == 0 {
+        return None;
+    }
+    Some(f35 * w.max(h) as f64 / 36.0)
 }
 
 /// Full pipeline over a folder of photos.
@@ -135,14 +163,35 @@ pub fn run_sfm(paths: &[PathBuf], opts: &Options, log: &dyn Fn(&str)) -> Result<
         .collect();
 
     // ---- Cameras (one per image; refined later by BA) ----
+    // Focal prior: EXIF 35mm-equivalent when available (scaled to the
+    // working resolution), else the focal_mult heuristic. A wrong prior
+    // poisons the initial two-view reconstruction, so EXIF matters.
+    let mut exif_hits = 0usize;
     let cams: Vec<Cam> = frames
         .iter()
-        .map(|f| {
-            let mut c = Cam::new(opts.focal_mult * f.width.max(f.height) as f64, f.width as f64, f.height as f64);
-            c.f = opts.focal_mult * f.width.max(f.height) as f64;
-            c
+        .zip(orig_dims.iter())
+        .zip(paths.iter())
+        .map(|((f, od), p)| {
+            let prior = opts.focal_mult * f.width.max(f.height) as f64;
+            let fpx = if od.0 > 0 && od.1 > 0 && opts.use_exif {
+                exif_focal_px(p, od.0, od.1).map(|fo| {
+                    fo * f.width.max(f.height) as f64 / od.0.max(od.1) as f64
+                })
+            } else {
+                None
+            };
+            if fpx.is_some() {
+                exif_hits += 1;
+            }
+            Cam::new(fpx.unwrap_or(prior), f.width as f64, f.height as f64)
         })
         .collect();
+    log(&format!(
+        "focal prior: EXIF for {}/{} images (fallback {:.1} x max side)",
+        exif_hits,
+        frames.len(),
+        opts.focal_mult
+    ));
 
     // ---- Matching + two-view verification (parallel over pairs) ----
     let t1 = Instant::now();

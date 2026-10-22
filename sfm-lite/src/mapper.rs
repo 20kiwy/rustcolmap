@@ -11,7 +11,7 @@ use nalgebra::{Matrix3, Vector3};
 
 use crate::ba::{self, BaCam, BaObs};
 use crate::geom::{Cam, Pose, tri_angle_deg, triangulate};
-use crate::matching::{TwoView, pnp_ransac};
+use crate::matching::{TwoView, pnp_ransac_f};
 use crate::scene::{FrameInfo, Scene};
 
 pub struct MapperOptions {
@@ -188,6 +188,85 @@ pub fn map2(
     let mut attempted: Vec<usize> = Vec::new();
     let mut ba_rounds = 0usize;
 
+    let dbg_nbv = std::env::var("SFM_DEBUG_NBV").is_ok();
+    if dbg_nbv {
+        for &r in scene.registered.iter() {
+            let n_some = scene.kp_point[r].iter().filter(|s| s.is_some()).count();
+            log(&format!("[nbv] init: kp_point[{}] Some-count={} (pts={})", r, n_some, scene.points.len()));
+        }
+        // Structure planarity (rank of centered point cloud).
+        let n = scene.points.len();
+        if n >= 3 {
+            let mu = scene.points.iter().fold(Vector3::zeros(), |a, p| a + p.xyz) / n as f64;
+            let mut c = nalgebra::OMatrix::<f64, nalgebra::U3, nalgebra::Dyn>::zeros(n);
+            for (i, p) in scene.points.iter().enumerate() {
+                c.set_column(i, &(p.xyz - mu));
+            }
+            let svd = c.svd(false, false);
+            let sv = svd.singular_values;
+            let (s0, s1, s2) = (sv[0], sv[1], sv[2]);
+            log(&format!(
+                "[nbv] init structure singular values: {s0:.3} {s1:.3} {s2:.3} (planarity s3/s1={:.4})",
+                if s0 > 0.0 { s2 / s0 } else { 0.0 }
+            ));
+        }
+        // Triangulation-angle distribution of the init points (from cam 0
+        // of the init pair) + the init relative pose itself.
+        let f0 = scene.registered[0];
+        let f1 = scene.registered[1];
+        if let (Some(p0), Some(p1)) = (scene.pose(f0), scene.pose(f1)) {
+            let mut angs: Vec<f64> = scene
+                .points
+                .iter()
+                .filter(|p| p.track.len() >= 2)
+                .map(|p| crate::geom::tri_angle_deg(p0, p1, &p.xyz))
+                .collect();
+            angs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            if !angs.is_empty() {
+                let (med, p90) = (angs[angs.len() / 2], angs[(angs.len() * 9) / 10]);
+                log(&format!(
+                    "[nbv] init tri angles: median={med:.2}deg p90={p90:.2}deg min={:.2} max={:.2}",
+                    angs[0],
+                    angs[angs.len() - 1]
+                ));
+            }
+            log(&format!(
+                "[nbv] init pose R(t0->t1) t_dir=({:.4},{:.4},{:.4})",
+                p1.t.x, p1.t.y, p1.t.z
+            ));
+        }
+        // Dump raw init geometry for external cross-checking.
+        if std::env::var("SFM_DUMP_INIT").is_ok() {
+            let f0 = scene.registered[0];
+            let f1 = scene.registered[1];
+            if let (Some(p0), Some(p1)) = (scene.pose(f0), scene.pose(f1)) {
+                let mut s = String::new();
+                let cam0 = scene.cams[f0];
+                s.push_str(&format!("K {} {} {}\n", cam0.f, cam0.cx, cam0.cy));
+                s.push_str(&format!("R {:.12} {:.12} {:.12}\n", p1.r[(0, 0)], p1.r[(0, 1)], p1.r[(0, 2)]));
+                s.push_str(&format!("R {:.12} {:.12} {:.12}\n", p1.r[(1, 0)], p1.r[(1, 1)], p1.r[(1, 2)]));
+                s.push_str(&format!("R {:.12} {:.12} {:.12}\n", p1.r[(2, 0)], p1.r[(2, 1)], p1.r[(2, 2)]));
+                s.push_str(&format!("T {:.12} {:.12} {:.12}\n", p1.t.x, p1.t.y, p1.t.z));
+                let mut cnt = 0;
+                'outer: for (pi, p) in scene.points.iter().enumerate() {
+                    if p.track.len() < 2 { continue; }
+                    let (fa, ka) = p.track[0];
+                    let (fb, kb) = p.track[1];
+                    let (u1, v1) = (scene.frames[fa].pts[ka as usize][0], scene.frames[fa].pts[ka as usize][1]);
+                    let (u2, v2) = (scene.frames[fb].pts[kb as usize][0], scene.frames[fb].pts[kb as usize][1]);
+                    s.push_str(&format!(
+                        "P {:.6} {:.6} {:.6} | u1 {:.2} v1 {:.2} u2 {:.2} v2 {:.2}\n",
+                        p.xyz.x, p.xyz.y, p.xyz.z, u1, v1, u2, v2
+                    ));
+                    cnt += 1;
+                    if cnt >= 25 { break 'outer; }
+                }
+                let _ = std::fs::write("/tmp/sfm_init_dump.txt", s);
+                log("[nbv] dumped init geometry to /tmp/sfm_init_dump.txt");
+            }
+        }
+    }
+
     loop {
         // Next best view: most reconstructed points visible.
         let mut best: Option<(usize, usize, Vec<(u32, usize)>)> = None;
@@ -209,8 +288,26 @@ pub fn map2(
             }
             let cnt = seen.len();
             if cnt > best.as_ref().map_or(0, |(_, c, _)| *c) {
-                let corrs: Vec<(u32, usize)> = seen.into_iter().collect();
+                // Deterministic order: HashMap iteration order is randomized
+                // per process, which would shuffle RANSAC inputs run-to-run.
+                let mut corrs: Vec<(u32, usize)> = seen.into_iter().collect();
+                corrs.sort_by_key(|&(k, _)| k);
                 best = Some((f, cnt, corrs));
+            }
+        }
+        if dbg_nbv {
+            if let Some((f, c, _)) = best.as_ref() {
+                for &r in scene.registered.iter() {
+                    let (a, b, _, _) = match pair_view(&pairs, *f, r) {
+                        Some(v) => v,
+                        None => {
+                            log(&format!("[nbv] cand {} vs r {}: NO PAIR", f, r));
+                            continue;
+                        }
+                    };
+                    let hits = a.iter().zip(b.iter()).filter(|(_kf, kr)| scene.kp_point[r][**kr as usize].is_some()).count();
+                    log(&format!("[nbv] cand {} vs r {}: matches={} kp_hits={}", f, r, a.len(), hits));
+                }
             }
         }
         let (f, cnt, corrs) = match best {
@@ -222,7 +319,7 @@ pub fn map2(
                         let mut n = 0;
                         for &r in scene.registered.iter() {
                             if let Some((a, b, _, _)) = pair_view(&pairs, g, r) {
-                                for (kf, kr) in a.iter().zip(b.iter()) {
+                                for (_kf, kr) in a.iter().zip(b.iter()) {
                                     if scene.kp_point[r][*kr as usize].is_some() {
                                         n += 1;
                                         break;
@@ -238,7 +335,7 @@ pub fn map2(
             }
         };
 
-        // PnP registration.
+        // PnP registration with focal self-calibration (COLMAP-style).
         let pixels: Vec<[f64; 2]> = corrs
             .iter()
             .map(|&(k, _)| scene.frames[f].pts[k as usize])
@@ -247,10 +344,10 @@ pub fn map2(
             .iter()
             .map(|&(_, pi)| scene.points[pi].xyz)
             .collect();
-        let cam = scene.cams[f];
-        let reg = pnp_ransac(&pixels, &pts3d, &cam, opts.reproj_thr * 1.5);
-        let (pose, inl) = match reg {
-            Some((p, i)) => (p, i),
+        let cam_prior = scene.cams[f];
+        let reg = pnp_ransac_f(&pixels, &pts3d, &cam_prior, opts.reproj_thr * 1.5);
+        let (pose, cam_est, inl) = match reg {
+            Some((p, c, i)) => (p, c, i),
             None => {
                 attempted.push(f);
                 continue;
@@ -260,6 +357,7 @@ pub fn map2(
             attempted.push(f);
             continue;
         }
+        scene.cams[f] = cam_est;
         scene.register(f, pose);
 
         // Extend existing tracks with the newly registered image.
@@ -270,7 +368,7 @@ pub fn map2(
                 Some(v) => v,
                 None => continue,
             };
-            for (_kf, kr) in a.iter().zip(b.iter()) {
+            for (kf, kr) in a.iter().zip(b.iter()) {
                 if let Some(pi) = scene.kp_point[r][*kr as usize] {
                     scene.add_observation(pi as usize, f, *kf);
                 }
@@ -294,14 +392,14 @@ pub fn map2(
                 {
                     continue;
                 }
-                let x1 = cam.normalize(scene.frames[f].pts[*kf as usize][0], scene.frames[f].pts[*kf as usize][1]);
+                let x1 = scene.cams[f].normalize(scene.frames[f].pts[*kf as usize][0], scene.frames[f].pts[*kf as usize][1]);
                 let x2 = scene.cams[r].normalize(scene.frames[r].pts[*kr as usize][0], scene.frames[r].pts[*kr as usize][1]);
                 if let Some(x) = triangulate(&pf.r, &pf.t, &pose_r.r, &pose_r.t, x1, x2) {
                     let ang = tri_angle_deg(&pf, &pose_r, &x);
                     if ang < opts.min_tri_angle {
                         continue;
                     }
-                    let ok_f = pf.project(&cam, &x).map_or(false, |(u, v)| {
+                    let ok_f = pf.project(&scene.cams[f], &x).map_or(false, |(u, v)| {
                         (u - scene.frames[f].pts[*kf as usize][0]).hypot(v - scene.frames[f].pts[*kf as usize][1]) <= opts.reproj_thr
                     });
                     let ok_r = pose_r.project(&scene.cams[r], &x).map_or(false, |(u, v)| {
@@ -319,14 +417,23 @@ pub fn map2(
         // grows and repairs early low-parallax triangulations.
         ba_global(&mut scene, opts.ba_iters);
         ba_rounds += 1;
-        scene.filter_points();
+        let (ro1, rp1) = scene.filter_points();
         scene.retriangulate();
-        scene.filter_points();
+        let (ro2, rp2) = scene.filter_points();
+        if dbg_nbv {
+            for &r in scene.registered.iter() {
+                let n_some = scene.kp_point[r].iter().filter(|s| s.is_some()).count();
+                log(&format!(
+                    "[nbv] after-refine: kp_point[{r}] Some={n_some} | removed obs {ro1}+{ro2}, pts {rp1}+{rp2}"
+                ));
+            }
+        }
         log(&format!(
-            "registered {} ({}/{} visible pts) | total points {}",
+            "registered {} ({}/{} visible pts, f={:.0}px) | total points {}",
             frames[f].name,
             cnt,
             corrs.len(),
+            scene.cams[f].f,
             scene.points.len()
         ));
         attempted.clear();

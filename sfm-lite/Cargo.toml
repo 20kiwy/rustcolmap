@@ -9,4 +9,5 @@ description = "Rust-native incremental Structure-from-Motion engine (SIFT, robus
 image = "0.24"
 nalgebra = "0.32"
 rayon = "1"
+kamadak-exif = "0.6"
 colmap-io = { path = "../colmap-io" }

@@ -313,6 +313,67 @@ pub fn verify_pair(
     })
 }
 
+/// Focal-multiplier fan tried at registration time (relative to the prior
+/// focal). Covers typical real cameras (~0.5-2.0 x max side).
+pub const FOCAL_MULTS: [f64; 6] = [0.4, 0.6, 0.8, 1.0, 1.35, 1.8];
+
+/// COLMAP-style focal self-calibration at registration: run PnP-RANSAC for
+/// each focal hypothesis and keep the best-supported (pose, focal, inliers).
+/// The initial two-view reconstruction cannot observe focal length, so the
+/// focal only becomes observable once a third view registers — exactly here.
+/// Returns (pose, camera-with-estimated-focal, inlier indices).
+pub fn pnp_ransac_f(
+    pixels: &[[f64; 2]],
+    pts3d: &[Vector3<f64>],
+    cam_prior: &Cam,
+    thr_px: f64,
+) -> Option<(Pose, Cam, Vec<usize>)> {
+    let dbg = std::env::var("SFM_DEBUG_PNP").is_ok();
+    let mut best: Option<(Pose, Cam, Vec<usize>, f64)> = None;
+    for &m in FOCAL_MULTS.iter() {
+        let cam_h = Cam { f: cam_prior.f * m, ..*cam_prior };
+        let (pose, inl) = match pnp_ransac(pixels, pts3d, &cam_h, thr_px) {
+            Some(v) => v,
+            None => {
+                if dbg {
+                    eprintln!("[pnpf] f={:.0} -> None", cam_h.f);
+                }
+                continue;
+            }
+        };
+        let mean = if inl.is_empty() {
+            f64::INFINITY
+        } else {
+            inl.iter()
+                .map(|&k| {
+                    pose.project(&cam_h, &pts3d[k])
+                        .map_or(f64::INFINITY, |(u, v)| {
+                            (u - pixels[k][0]).hypot(v - pixels[k][1])
+                        })
+                })
+                .sum::<f64>()
+                / inl.len() as f64
+        };
+        if dbg {
+            eprintln!(
+                "[pnpf] f={:.0} inl={}/{} mean_err={:.2}px",
+                cam_h.f,
+                inl.len(),
+                pixels.len(),
+                mean
+            );
+        }
+        let better = match &best {
+            None => true,
+            Some((_, _, bi, be)) => (inl.len(), -mean) > (bi.len(), -(*be)),
+        };
+        if better {
+            best = Some((pose, cam_h, inl, mean));
+        }
+    }
+    best.map(|(p, c, i, _)| (p, c, i))
+}
+
 /// PnP-RANSAC registration of one image against 2D-3D correspondences.
 /// Returns (pose, inlier indices into `pixels`/`pts3d`).
 pub fn pnp_ransac(

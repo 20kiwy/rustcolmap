@@ -42,13 +42,47 @@ What is implemented, natively in Rust (`nalgebra` + `image` + `rayon` only):
 runs the *entire* pipeline on the synthetic photos (no ground-truth leakage):
 
 ```
-demo PASS: registered=10/10  points=3278
-  mean reprojection error      0.43 px
-  median rotation error        0.61°
-  median camera-center error   0.27 scene units (~6% of arc radius)
-  focal self-calibration       550.1 px recovered vs 550.0 ground truth
-  track consistency vs GT      98%+ observations labeled to one scene point
+demo PASS: registered=10/10  points=3272
+  mean reprojection error      0.80 px
+  median rotation error        0.81°
+  median camera-center error   0.35 scene units
+  focal self-calibration       549.4 px recovered vs 550.0 ground truth
 ```
+
+## Results (real-world tests)
+
+**Real video** (Big Buck Bunny 1080p H.264, 10 s clip → 20 frames @ 2 fps,
+960 px, `ffmpeg`-extracted, no EXIF):
+
+```
+gs-export --images frames/ --out dataset --txt --ply
+→ registered 20/20 frames, 6657 sparse points
+  mean reprojection 1.32 px, full COLMAP sparse/0 + PLY output
+  per-frame focal self-calibration active (no priors available)
+```
+
+**Real photos** (Lund, 8 views around a university building, 1024×768,
+EXIF 35 mm-equivalent focal read automatically): reconstructs the sequence;
+forward-walking init pairs (all-parallax < 1°, i.e. pure translation along
+the optical axis) remain the weak spot — see Known limitations.
+
+EXIF: the engine reads `FocalLengthIn35mmFilm` (kamadak-exif) and seeds each
+camera's focal prior with `f_px = f35 · max_side / 36`. Without it, video
+frames fall back to the 1.2 × max-side heuristic plus a 6-hypothesis focal
+fan tried at every PnP registration (COLMAP-style self-calibration).
+
+## Known limitations (real-data honesty)
+
+- **Forward-motion initialization.** When *every* candidate pair moves
+  almost purely along the optical axis (walking toward a wall), the two-view
+  geometry is ill-conditioned and COLMAP-grade init scoring (which tries and
+  scores many candidate pairs by angle spread + multi-view support) is needed.
+  Lateral / orbital capture works well. On the roadmap: trifocal
+  initialization over the top-K pairs.
+- **No dense MVS** — output is the sparse cloud 3DGS needs (poses + sparse
+  points), not a dense mesh.
+- **Scale** is monocular (unit-norm essential translation), like COLMAP's
+  uninitialized mode.
 
 ## Quick start
 
