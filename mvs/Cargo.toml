@@ -1,0 +1,13 @@
+[package]
+name = "mvs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Dense multi-view stereo (patch-match depth maps + geometric-consistency fusion), 100% Rust"
+
+[dependencies]
+colmap-io = { path = "../colmap-io" }
+sfm-lite = { path = "../sfm-lite" }
+nalgebra = "0.32"
+image = "0.24"
+rayon = "1"

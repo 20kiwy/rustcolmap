@@ -5,6 +5,10 @@
 //! <out>/
 //! ├── images/          (copied from --images)
 //! ├── points3d.ply     (optional, --ply)
+//! ├── dense/
+//! │   ├── dense.ply    (optional, --mvs: fused DENSE colored point cloud)
+//! │   ├── mvs_stats.json
+//! │   └── depth_vis/   (optional, --save-depth)
 //! └── sparse/0/
 //!     ├── cameras.bin
 //!     ├── images.bin
@@ -12,7 +16,7 @@
 //! ```
 //!
 //! Usage examples:
-//!   gs-export --images ./photos --out ./dataset
+//!   gs-export --images ./photos --out ./dataset --mvs
 //!   gs-export --images ./photos --out ./dataset --sequential --txt --ply
 //!   gs-export --demo ./demo_out          # synthetic self-test
 //!   # then: python train.py -s ./dataset            (graphdeco 3DGS)
@@ -37,6 +41,8 @@ USAGE:
 OPTIONS:
   --images <dir>       input folder with photos (required)
   --out <dir>          output dataset folder (required)
+  --sparse <dir>       reuse an existing COLMAP sparse/0 reconstruction
+                       (skips SfM; enables --mvs-only runs)
   --max-features <n>   SIFT keypoints per image        [default: 2048]
   --max-dim <px>       downscale longest side for SfM  [default: 1600]
   --ratio <f>          Lowe ratio threshold            [default: 0.8]
@@ -47,6 +53,13 @@ OPTIONS:
   --sequential         match temporal neighbors only (video-like sets)
   --txt                also write COLMAP .txt files
   --ply                also write points3d.ply
+  --mvs                dense multi-view stereo: depth maps + fused dense.ply
+  --mvs-max-dim <px>   stereo working resolution        [default: 900]
+  --mvs-sources <k>    support views per reference view  [default: 3]
+  --mvs-consistent <n> min confirming views for fusion   [default: 2]
+  --mvs-cost-thr <f>   census cost gate (lower = stricter) [default: 0.38]
+  --mvs-depth-diff <f> relative depth agreement for fusion [default: 0.03]
+  --save-depth         write per-view depth-map PNGs to dense/depth_vis/
   --demo <dir> [n]     run synthetic end-to-end self-test (default 10 imgs)
   -h, --help           this help
 ";
@@ -119,15 +132,20 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut images: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
+    let mut sparse_in: Option<PathBuf> = None;
     let mut opts = Options::default();
     let mut also_txt = false;
     let mut also_ply = false;
+    let mut run_mvs_flag = false;
+    let mut save_depth = false;
+    let mut mvs_opts = mvs::MvsOptions::default();
     let mut demo: Option<(PathBuf, usize)> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "--images" => images = Some(PathBuf::from(args.next().unwrap_or_default())),
             "--out" => out = Some(PathBuf::from(args.next().unwrap_or_default())),
+            "--sparse" => sparse_in = Some(PathBuf::from(args.next().unwrap_or_default())),
             "--max-features" => opts.max_features = parse_num(&mut args, "max-features"),
             "--max-dim" => opts.max_dim = parse_num(&mut args, "max-dim"),
             "--ratio" => opts.ratio = parse_num(&mut args, "ratio"),
@@ -138,6 +156,16 @@ fn main() {
             "--sequential" => opts.sequential = true,
             "--txt" => also_txt = true,
             "--ply" => also_ply = true,
+            "--mvs" => run_mvs_flag = true,
+            "--mvs-max-dim" => mvs_opts.max_dim = parse_num(&mut args, "mvs-max-dim"),
+            "--mvs-sources" => mvs_opts.num_sources = parse_num(&mut args, "mvs-sources"),
+            "--mvs-consistent" => mvs_opts.min_consistent = parse_num(&mut args, "mvs-consistent"),
+            "--mvs-cost-thr" => mvs_opts.cost_thr = parse_num(&mut args, "mvs-cost-thr"),
+            "--mvs-depth-diff" => mvs_opts.depth_diff = parse_num(&mut args, "mvs-depth-diff"),
+            "--save-depth" => {
+                save_depth = true;
+                run_mvs_flag = true;
+            }
             "--demo" => {
                 let dir = PathBuf::from(args.next().unwrap_or_else(|| "demo_out".into()));
                 let n = args
@@ -180,13 +208,6 @@ fn main() {
     }
 
     // ---- Real photos mode ----
-    let images = match images {
-        Some(p) if p.is_dir() => p,
-        _ => {
-            eprintln!("--images must point to an existing folder\n{HELP}");
-            exit(2);
-        }
-    };
     let out = match out {
         Some(p) => p,
         None => {
@@ -195,42 +216,89 @@ fn main() {
         }
     };
 
-    let read: std::io::Result<Vec<PathBuf>> = fs::read_dir(&images).map(|rd| {
-        rd.filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_file() && is_image(p))
-            .collect()
-    });
-    let mut files: Vec<PathBuf> = match read {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("cannot read {}: {e}", images.display());
-            exit(1);
-        }
-    };
-    files.sort_by(|a, b| {
-        let na = a.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let nb = b.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        natural_cmp(&na, &nb)
-    });
-    if files.len() < 2 {
-        eprintln!("need at least 2 images in {}", images.display());
-        exit(1);
-    }
-    eprintln!(
-        "sfm: {} images, features={}, max_dim={}, matching={} ...",
-        files.len(),
-        opts.max_features,
-        opts.max_dim,
-        if opts.sequential { "sequential" } else { "exhaustive" }
-    );
-
     let t0 = Instant::now();
-    let res = match run_sfm(&files, &opts, &log) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("SfM failed: {e}");
+    // Two entry paths: reuse an existing sparse reconstruction (--sparse)
+    // or run the full SfM pipeline over --images.
+    let (res, files) = if let Some(sp) = sparse_in {
+        let rec = colmap_io::read_dir_any(&sp).unwrap_or_else(|e| {
+            eprintln!("cannot read sparse reconstruction {}: {e}", sp.display());
+            exit(1);
+        });
+        eprintln!(
+            "sparse: loaded {} images, {} points from {}",
+            rec.images.len(),
+            rec.points3d.len(),
+            sp.display()
+        );
+        let img_dir = images.clone().unwrap_or_else(|| out.join("images"));
+        let files: Vec<PathBuf> = fs::read_dir(&img_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.is_file() && is_image(p))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if files.is_empty() {
+            eprintln!(
+                "--mvs needs the photos: pass --images <dir> (or keep <out>/images populated)"
+            );
+            exit(2);
+        }
+        (
+            sfm_lite::SfmResult {
+                registered: rec.images.len(),
+                points: rec.points3d.len(),
+                skipped: vec![],
+                mean_reproj: 0.0,
+                ba_rounds: 0,
+                rec,
+            },
+            files,
+        )
+    } else {
+        let images = match images {
+            Some(p) if p.is_dir() => p,
+            _ => {
+                eprintln!("--images must point to an existing folder\n{HELP}");
+                exit(2);
+            }
+        };
+        let read: std::io::Result<Vec<PathBuf>> = fs::read_dir(&images).map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file() && is_image(p))
+                .collect()
+        });
+        let mut files: Vec<PathBuf> = match read {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("cannot read {}: {e}", images.display());
+                exit(1);
+            }
+        };
+        files.sort_by(|a, b| {
+            let na = a.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let nb = b.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            natural_cmp(&na, &nb)
+        });
+        if files.len() < 2 {
+            eprintln!("need at least 2 images in {}", images.display());
             exit(1);
         }
+        eprintln!(
+            "sfm: {} images, features={}, max_dim={}, matching={} ...",
+            files.len(),
+            opts.max_features,
+            opts.max_dim,
+            if opts.sequential { "sequential" } else { "exhaustive" }
+        );
+        let res = match run_sfm(&files, &opts, &log) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SfM failed: {e}");
+                exit(1);
+            }
+        };
+        (res, files)
     };
     eprintln!(
         "done: registered {} images, {} points, mean reproj {:.2}px, {} BA rounds in {:.1}s (skipped: {})",
@@ -272,6 +340,22 @@ fn main() {
     for p in &files {
         if let Some(name) = p.file_name() {
             let _ = fs::copy(p, img_out.join(name));
+        }
+    }
+
+    if run_mvs_flag {
+        let mlog = |s: &str| eprintln!("{s}");
+        mvs_opts.save_depth_vis = save_depth;
+        match mvs::run_mvs(&res.rec, &img_out, &out, &mvs_opts, &mlog) {
+            Ok(st) => {
+                eprintln!(
+                    "mvs: {} views -> {} dense points in {:.1}s",
+                    st.views_with_depth, st.dense_points, st.elapsed_s
+                );
+            }
+            Err(e) => {
+                eprintln!("mvs failed (sparse outputs are still valid): {e}");
+            }
         }
     }
 

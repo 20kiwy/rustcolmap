@@ -1,15 +1,20 @@
 # RustCOLMAP
 
-**A native-Rust incremental Structure-from-Motion pipeline with COLMAP-compatible output, purpose-built to feed Gaussian Splatting trainers.**
+**A native-Rust incremental Structure-from-Motion + dense Multi-View Stereo pipeline with COLMAP-compatible output, purpose-built to feed Gaussian Splatting trainers.**
 
 ```
 photos ──▶ SIFT ──▶ robust matching ──▶ two-view verification ──▶ incremental mapping
-       ──▶ bundle adjustment ──▶ COLMAP sparse/0 ──▶ 3DGS / nerfstudio / gsplat
+       ──▶ bundle adjustment ──▶ COLMAP sparse/0 ──▶ patch-match stereo ──▶ dense fusion
+       ──▶ dense.ply + sparse/0 ──▶ 3DGS / nerfstudio / gsplat
 ```
 
 ```text
 <dataset>/
 ├── images/            (your photos, copied)
+├── dense/             (with --mvs)
+│   ├── dense.ply      fused DENSE colored point cloud (binary PLY)
+│   ├── dense_web.json decimated copy for web viewers
+│   └── depth_vis/     per-view depth-map PNGs (--save-depth)
 └── sparse/0/
     ├── cameras.bin    (+ .txt)
     ├── images.bin     (+ .txt)
@@ -19,11 +24,10 @@ photos ──▶ SIFT ──▶ robust matching ──▶ two-view verification 
 ## What this is (and honestly isn't)
 
 COLMAP is a ~10-year, 100k+ line C++/CUDA research system. RustCOLMAP is a
-compact, dependency-light reimplementation of **COLMAP's incremental SfM
-core** — the part that produces camera poses and the sparse point cloud that
-Gaussian Splatting training consumes. It is *not* a line-for-line port and
-does not include dense MVS, vocab-tree retrieval, or GPU acceleration (see
-[roadmap](#roadmap)).
+compact, dependency-light reimplementation of **COLMAP's incremental SfM core
++ dense MVS stages** — camera poses, the sparse point cloud, and the fused
+dense colored point cloud. It is *not* a line-for-line port and does not
+include vocab-tree retrieval or GPU acceleration (see [roadmap](#roadmap)).
 
 What is implemented, natively in Rust (`nalgebra` + `image` + `rayon` only):
 
@@ -35,6 +39,7 @@ What is implemented, natively in Rust (`nalgebra` + `image` + `rayon` only):
 | **Incremental mapping** | Best-pair init (inliers + triangulation rate), next-best-view selection, PnP-DLT RANSAC registration, track extension, angle-gated triangulation, outlier filtering |
 | **Bundle adjustment** | Schur-complement Levenberg–Marquardt, SIMPLE_RADIAL cameras (f, cx, cy, k refined), quaternion+translation parametrization, Huber loss, Jacobi column scaling, per-registration BA + **re-triangulation** |
 | **Export** | Exact COLMAP binary + text formats (validated byte-level), full-resolution camera rescaling, PLY point clouds |
+| **Dense MVS** | Slanted-plane patch-match stereo per view: 7×7 census (48-bit) cost over a 5×5 window averaged across K support views, plane-sweep init in inverse depth, red-black propagation + decaying random refinement (deterministic per-pixel RNG), **texture gate** (flat census descriptors can't fake a match), geometric-consistency fusion across all co-visible views, voxel-hash dedup → binary PLY + depth-map PNGs. CPU only (rayon). |
 
 ## Results (synthetic ground-truth self-test)
 
@@ -66,6 +71,23 @@ EXIF 35 mm-equivalent focal read automatically): reconstructs the sequence;
 forward-walking init pairs (all-parallax < 1°, i.e. pure translation along
 the optical axis) remain the weak spot — see Known limitations.
 
+**Dense MVS on the real data** (2 CPU cores, no GPU):
+
+```
+# add dense output to an existing reconstruction (skips SfM)
+gs-export --sparse dataset/sparse/0 --images dataset/images \
+          --out dataset --mvs --mvs-max-dim 700 --save-depth
+
+Sceaux Castle (8 photos, 700 px):   51,239 fused dense points, ~2 min
+Big Buck Bunny (20 cartoon frames, 560 px, loose gates):
+                                     60,904 fused dense points
+```
+
+Depth maps show coherent structure (rooflines, chimneys, foliage patches);
+flat sky and overexposed surfaces are texture-gated out by design. Cartoon
+content (flat shading, foliage, big inter-frame baselines) is the worst case
+for photometric stereo — real textured photos fuse much more completely.
+
 EXIF: the engine reads `FocalLengthIn35mmFilm` (kamadak-exif) and seeds each
 camera's focal prior with `f_px = f35 · max_side / 36`. Without it, video
 frames fall back to the 1.2 × max-side heuristic plus a 6-hypothesis focal
@@ -79,8 +101,10 @@ fan tried at every PnP registration (COLMAP-style self-calibration).
   scores many candidate pairs by angle spread + multi-view support) is needed.
   Lateral / orbital capture works well. On the roadmap: trifocal
   initialization over the top-K pairs.
-- **No dense MVS** — output is the sparse cloud 3DGS needs (poses + sparse
-  points), not a dense mesh.
+- **Dense MVS is CPU-resolution-bounded.** Quality matches the COLMAP class
+  at reduced working resolution (`--mvs-max-dim`); on 2 cores a full-HD
+  dense run takes minutes. No slanted-plane normal fusion into meshes yet —
+  output is the dense POINT cloud, meshing is a separate stage.
 - **Scale** is monocular (unit-norm essential translation), like COLMAP's
   uninitialized mode.
 
@@ -93,8 +117,12 @@ cargo build --release
 ./target/release/gs-export --demo ./demo_out           # 10 cameras
 ./target/release/gs-export --demo ./demo_out 16        # 16 cameras
 
-# 2. Your photos -> 3DGS dataset
-./target/release/gs-export --images ./photos --out ./dataset --txt --ply
+# 2. Your photos -> 3DGS dataset + DENSE point cloud
+./target/release/gs-export --images ./photos --out ./dataset --txt --ply --mvs --save-depth
+
+# or: add dense output to an existing sparse/0 (skips SfM)
+./target/release/gs-export --sparse ./dataset/sparse/0 --images ./dataset/images \
+                           --out ./dataset --mvs --mvs-max-dim 700
 
 # 3. Feed the dataset to your trainer
 python train.py -s ./dataset                 # graphdeco 3DGS
@@ -106,8 +134,13 @@ resolution, default 1600), `--ratio` (Lowe threshold, default 0.75),
 `--min-angle` (min triangulation angle), `--ba-every`, `--sequential`
 (temporal matching for video-like captures), `--txt`, `--ply`.
 
+MVS options: `--mvs`, `--mvs-max-dim` (stereo resolution, default 900),
+`--mvs-sources` (support views, default 3), `--mvs-cost-thr` (census gate,
+default 0.38), `--mvs-depth-diff` (fusion agreement, default 0.03),
+`--mvs-consistent` (min confirming views, default 2), `--save-depth`.
+
 Point clouds can be inspected with any PLY viewer (e.g. MeshLab) via
-`points3d.ply`.
+`points3d.ply` (sparse) and `dense/dense.ply` (dense).
 
 ## Design notes
 
@@ -133,15 +166,17 @@ Point clouds can be inspected with any PLY viewer (e.g. MeshLab) via
 |---|---|
 | `colmap-io` | std-only COLMAP sparse reader/writer (.bin + .txt) |
 | `sfm-lite` | the SfM engine: `sift`, `matching`, `geom`, `ba`, `scene`, `mapper`, self-test `demo` |
-| `gs-export` | CLI: photos → 3DGS-ready dataset (or `--demo` self-test) |
+| `mvs` | dense stage: `stereo` (census patch-match depth maps), `fuse` (consistency fusion + PLY) |
+| `gs-export` | CLI: photos → 3DGS-ready dataset + dense.ply (or `--demo` self-test) |
 
 ## Roadmap
 
-- [ ] GPU SIFT + matching (wgpu compute shaders as the CUDA replacement)
+- [ ] GPU SIFT + matching + patch-match (wgpu compute shaders as the CUDA replacement)
 - [ ] 5-point essential solver (replaces 8-point F→E path)
 - [ ] Vocab-tree / retrieval-based matching for large unordered collections
 - [ ] Local BA windows (currently global BA per registration)
-- [ ] Dense MVS: patch-match stereo + fusion (the big one)
+- [x] Dense MVS: patch-match stereo + consistency fusion (`mvs` crate, CPU)
+- [ ] Dense meshing: normal estimation + Poisson-like surface reconstruction
 - [ ] Glomap-style global SfM alternative
 
 ## License

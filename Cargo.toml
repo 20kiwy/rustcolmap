@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["colmap-io", "sfm-lite", "gs-export"]
+members = ["colmap-io", "sfm-lite", "gs-export", "mvs"]
 
 [profile.release]
 opt-level = 3
